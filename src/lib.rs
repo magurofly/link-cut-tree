@@ -1,46 +1,65 @@
 use std::rc::*;
 use std::cell::*;
 
-pub type RefNode = RefCell<Node>;
+pub type RefNode = RefCell<LCTNode>;
 pub type RcNode = Rc<RefNode>;
 pub type WeakNode = Weak<RefNode>;
 
-pub struct Node {
+pub struct LCTNode {
     parent: Option<WeakNode>,
     children: [Option<RcNode>; 2],
+    len: usize,
 }
 
-pub trait NodeBase: std::ops::Deref<Target = RefNode> {
-    fn rc(&self) -> &RcNode;
+pub trait LinkCutTree: std::ops::Deref<Target = RefNode> {
+    fn new() -> RcNode {
+        Rc::new(RefCell::new(LCTNode {
+            parent: None,
+            children: [None, None],
+            len: 1,
+        }))
+    }
 
-    fn clone_rc(&self) -> RcNode {
-        Rc::clone(self.rc())
+    fn ref_rc(&self) -> &RcNode;
+
+    fn get(&self) -> Ref<'_, LCTNode> { self.ref_rc().borrow() }
+    fn get_mut(&self) -> RefMut<'_, LCTNode> { self.ref_rc().borrow_mut() }
+
+    fn rc(&self) -> RcNode { Rc::clone(self.ref_rc()) }
+    fn weak(&self) -> WeakNode { Rc::downgrade(self.ref_rc()) }
+
+    fn len(&self) -> usize {
+        self.get().len
+    }
+
+    fn len_mut(&self) -> RefMut<usize> {
+        RefMut::map(self.get_mut(), |node| &mut node.len)
     }
 
     fn parent(&self) -> Option<RcNode> {
-        self.rc().borrow().parent.as_ref().and_then(Weak::upgrade)
+        self.get().parent.as_ref().and_then(Weak::upgrade)
     }
 
     fn parent_mut(&self) -> RefMut<Option<WeakNode>> {
-        RefMut::map(self.rc().borrow_mut(), |node| &mut node.parent)
+        RefMut::map(self.get_mut(), |node| &mut node.parent)
     }
 
     fn child(&self, dir: usize) -> Option<RcNode> {
         assert!(dir < 2);
-        Some(Rc::clone(self.rc().borrow().children[dir].as_ref()?))
+        Some(self.get().children[dir].as_ref()?.rc())
     }
 
     fn child_mut(&self, dir: usize) -> RefMut<Option<RcNode>> {
         assert!(dir < 2);
-        RefMut::map(self.rc().borrow_mut(), |node| &mut node.children[dir])
+        RefMut::map(self.get_mut(), |node| &mut node.children[dir])
     }
 
     /// 親から見た自分の向き
     fn dir(&self) -> Option<usize> {
-        let parent = self.rc().borrow().parent.as_ref()?.upgrade()?;
+        let parent = self.get().parent.as_ref()?.upgrade()?;
         for dir in 0 .. 2 {
-            if let Some(child) = &parent.borrow().children[dir] {
-                if Rc::ptr_eq(self.rc(), child) {
+            if let Some(child) = &parent.get().children[dir] {
+                if Rc::ptr_eq(self.ref_rc(), child) {
                     return Some(dir);
                 }
             }
@@ -57,6 +76,14 @@ pub trait NodeBase: std::ops::Deref<Target = RefNode> {
         self.dir().and_then(|_| self.parent())
     }
 
+    fn update(&self) {
+        let mut len = 1;
+        for child in self.get().children.iter() {
+            len += child.as_ref().map(|node| node.len()).unwrap_or(0);
+        }
+        *self.len_mut() = len;
+    }
+
     fn rotate(&self) {
         if let Some(dir) = self.dir() {
             let parent_weak = self.parent_mut().take().unwrap();
@@ -68,9 +95,11 @@ pub trait NodeBase: std::ops::Deref<Target = RefNode> {
             *parent.child_mut(dir) = child.clone();
             if let Some(parent_dir) = parent.dir() {
                 let ancestor = parent.parent().unwrap();
-                *ancestor.child_mut(parent_dir) = Some(self.clone_rc());
+                *ancestor.child_mut(parent_dir) = Some(self.rc());
             }
-            *self.parent_mut() = parent.parent_mut().replace(Rc::downgrade(self.rc()));
+            *self.parent_mut() = parent.parent_mut().replace(self.weak());
+            parent.update();
+            self.update();
         }
     }
 
@@ -88,19 +117,36 @@ pub trait NodeBase: std::ops::Deref<Target = RefNode> {
 
     /// 自身を木の根のパスにつなげ、そのパスの根にする
     fn expose(&self) {
-        self.splay();
-        let mut path_root = self.clone_rc();
-        while let Some(parent_path) = path_root.parent() {
-            *parent_path.child_mut(1) = Some(path_root.clone_rc());
-            parent_path.splay();
-            path_root = parent_path;
+        loop {
+            self.splay();
+            self.child_mut(1).take();
+            self.update();
+            if let Some(parent) = self.parent() {
+                parent.splay();
+                parent.child_mut(1).replace(self.rc());
+                parent.update();
+            } else {
+                break;
+            }
         }
-        self.splay();
+    }
+
+    /// 自身の親を new_parent にする
+    fn link(&self, new_parent: &Self) {
+        self.expose();
+        new_parent.expose();
+        self.parent_mut().replace(new_parent.weak());
+        new_parent.child_mut(1).replace(self.rc());
+    }
+
+    /// 自身を親から切り離す
+    fn cut(&self) {
+        self.child_mut(0).take().unwrap().parent_mut().take();
     }
 }
 
-impl NodeBase for RcNode {
-    fn rc(&self) -> &Self { self }
+impl LinkCutTree for RcNode {
+    fn ref_rc(&self) -> &Self { self }
 }
 
 #[cfg(test)]
